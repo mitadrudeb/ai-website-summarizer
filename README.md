@@ -1,4 +1,4 @@
-# 🌐 AI Website Summarizer — Open-Source Llama 3.2 (1B)
+# 🌐 AI Website Summarizer
 
 A practical AI-powered web tool that reads any website and provides an instant, plain-English summary using **Meta's open-source Llama 3.2 (1B Instruct)**.
 
