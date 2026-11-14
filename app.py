@@ -1,70 +1,134 @@
 import os
 import streamlit as st
-from dotenv import load_dotenv
-from openai import OpenAI
+import torch
+from transformers import pipeline
 from scraper import fetch_website_contents
 
-# Loading my API key from the .env file, same as I do in the notebook
-load_dotenv(override=True)
-api_key = os.getenv('OPENAI_API_KEY')
+# --- Streamlit Page Configuration ---
+st.set_page_config(
+    page_title="AI Website Summarizer — Llama 3.2 1B",
+    page_icon="🌐",
+    layout="centered",
+)
 
-# Setting up the OpenAI client once, so I don't recreate it every time someone clicks the button
-openai = OpenAI()
+# --- Model Configuration ---
+# We use Llama 3.2 1B (Instruction-Tuned).
+# By default, we point to unsloth/Llama-3.2-1B-Instruct (an un-gated mirror of Meta's official weights),
+# allowing anyone to run it immediately without needing a Hugging Face approval token.
+DEFAULT_MODEL = "unsloth/Llama-3.2-1B-Instruct"
 
-# Same system prompt I used in my notebook - tells the AI how to behave
-system_prompt = """
-    You are an experienced English professor who excels in summarization of any english language content. 
-    You will be given contents of websites and you will summerize the content using simple regular english in such a way that 
-    it is easily understood by anyone. Do not wrap the markdown in a code block - respond just with the markdown.
-"""
+@st.cache_resource(show_spinner=False)
+def load_llm_pipeline(model_id: str = DEFAULT_MODEL):
+    """
+    Load the Llama 3.2 1B text-generation pipeline.
+    Cached so it loads into memory only once across Streamlit reruns.
+    """
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    torch_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
 
-# Same user prompt template as my notebook
-user_prompt = """
-    Here are the contents of a website. Provide a short summay of this website.
-    If it includes news or annoucements, then summarize those too.
-"""
+    # Support optional HF_TOKEN from environment if using official meta-llama repos
+    hf_token = os.getenv("HF_TOKEN", None)
 
-# Building the messages list to send to the model - identical logic to messages_for() in my notebook
-def messages_for(website):
+    pipe = pipeline(
+        "text-generation",
+        model=model_id,
+        torch_dtype=torch_dtype,
+        device=device,
+        token=hf_token,
+    )
+    return pipe, device
+
+
+# --- Prompt Engineering ---
+system_prompt = (
+    "You are an experienced English professor who excels in summarization of any English language content. "
+    "You will be given the text contents of a website and your job is to summarize it using clear, everyday English "
+    "that is easily understood by anyone. If the website includes news, updates, or announcements, include a concise "
+    "section highlighting them. Format your output in clean Markdown."
+)
+
+user_prompt_template = (
+    "Here are the contents of a website. Please provide a clear, structured summary:\n\n"
+)
+
+
+def messages_for(website_content: str):
+    """
+    Format conversational chat messages for Llama 3.2 Instruct.
+    """
     return [
         {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_prompt + website}
+        {"role": "user", "content": f"{user_prompt_template}{website_content}"},
     ]
 
-# Same summarize function from my notebook, just moved here so the app can use it
-def summarize(url):
+
+def summarize(url: str, pipe, max_new_tokens: int = 300) -> str:
+    """
+    Fetch website text and generate summary using Llama 3.2 1B.
+    """
     website = fetch_website_contents(url)
-    response = openai.chat.completions.create(
-        model="gpt-4.1-mini",
-        messages=messages_for(website)
+    if not website or not website.strip():
+        return "⚠️ Could not extract meaningful text from this webpage."
+
+    messages = messages_for(website)
+    outputs = pipe(
+        messages,
+        max_new_tokens=max_new_tokens,
+        do_sample=False,  # Deterministic decoding for consistent summaries
     )
-    return response.choices[0].message.content
+    summary = outputs[0]["generated_text"][-1]["content"]
+    return summary, website
 
 
-# ---- This is where the actual web page/UI starts ----
-
-st.set_page_config(page_title="AI Website Summarizer", page_icon="🌐")
+# --- UI Layout ---
 
 st.title("🌐 AI Website Summarizer")
-st.write("Paste in any website link and get a simple, plain-English summary powered by AI.")
+st.caption("Powered by open-source **Meta Llama 3.2 (1B Parameters)** via Hugging Face Transformers.")
 
-# A quick warning if the API key isn't set up, so I don't get a confusing error later
-if not api_key:
-    st.error("No OpenAI API key found. Please add OPENAI_API_KEY to your .env file.")
+# Sidebar for hardware info & settings
+with st.sidebar:
+    st.header("⚙️ Model & Hardware")
+    device_name = "NVIDIA CUDA GPU" if torch.cuda.is_available() else "CPU (Standard)"
+    st.info(f"**Execution Device:** {device_name}")
+    st.markdown(
+        """
+        - **Model:** Llama 3.2 1B Instruct  
+        - **Parameters:** ~1.2 Billion  
+        - **Inference:** 100% Local / Open Source  
+        - **API Keys Needed:** Zero (No OpenAI API costs)
+        """
+    )
+    st.divider()
+    max_tokens = st.slider("Max Summary Length (tokens):", min_value=100, max_value=500, value=300, step=50)
 
-# Text box where the user types a URL
-url = st.text_input("Enter a website URL:", placeholder="https://example.com")
+# Main input form
+url = st.text_input(
+    "Enter a website URL to summarize:",
+    placeholder="https://en.wikipedia.org/wiki/Python_(programming_language)",
+)
 
-# Button that triggers the summarization when clicked
-if st.button("Summarize"):
-    if not url:
-        st.warning("Please enter a URL first.")
+if st.button("Summarize Website", type="primary"):
+    if not url or not url.strip():
+        st.warning("Please enter a valid URL first.")
     else:
-        # Showing a spinner while the request is in progress, since this can take a few seconds
-        with st.spinner("Reading the website and generating a summary..."):
+        # Load model with friendly spinner
+        with st.spinner("Loading Llama 3.2 1B into memory (first run downloads weights)..."):
             try:
-                summary = summarize(url)
-                st.markdown("### Summary")
-                st.markdown(summary)
+                pipe, device = load_llm_pipeline()
             except Exception as e:
-                st.error(f"Something went wrong: {e}")
+                st.error(f"Failed to load model: {e}")
+                pipe = None
+
+        if pipe is not None:
+            with st.spinner("Scraping webpage and generating summary with Llama 3.2..."):
+                try:
+                    summary, raw_text = summarize(url, pipe, max_new_tokens=max_tokens)
+                    st.success("✅ Summary Generated!")
+                    st.markdown("### 📝 Summary")
+                    st.markdown(summary)
+
+                    with st.expander("🔍 View Raw Scraped Website Content"):
+                        st.text(raw_text)
+
+                except Exception as e:
+                    st.error(f"Something went wrong during summarization: {e}")
